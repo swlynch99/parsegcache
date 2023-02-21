@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::util::ByteWriter;
+use crate::util::{ByteWriter, WriterCell, WriterToken};
 
 pub(crate) struct Segment<'seg> {
   data: SegmentData<'seg>,
@@ -22,7 +22,7 @@ impl<'seg> Segment<'seg> {
 
   /// Insert a new value into this segment. On success, returns a [`DataRef`]
   /// for the key-value pair.
-  /// 
+  ///
   /// # Safety
   /// This method may only be called from the writer thread.
   pub(crate) unsafe fn insert(&self, key: &[u8], value: &[u8]) -> Option<DataRef<'seg>> {
@@ -35,7 +35,7 @@ impl<'seg> Segment<'seg> {
       return None;
     }
 
-    let seghdr = self.segheader();
+    let seghdr = self.header();
 
     unsafe {
       let tail = seghdr.tail.load(Ordering::Relaxed);
@@ -61,12 +61,32 @@ impl<'seg> Segment<'seg> {
     SegmentIter::new(self)
   }
 
-  fn segheader(&self) -> &'seg SegmentHeader {
+  pub(crate) fn is_tail(&self, token: &WriterToken) -> bool {
+    self.header().next.get(token).is_none()
+  }
+
+  /// Extend this segment with another one.
+  ///
+  /// # Panics
+  /// Panics if this segment already has a next segment.
+  pub(crate) fn extend(&self, next: Segment<'seg>, token: &mut WriterToken) {
+    let prev = std::mem::replace(self.header().next.get_mut(token), Some(next));
+    assert!(prev.is_none());
+  }
+
+  /// Reset this segment back to a blank state.
+  /// 
+  /// Returns the next segment in the list, if there is one.
+  pub(crate) fn reset(&self, token: &mut WriterToken) -> Option<Segment<'seg>> {
+    self.header().reset(token)
+  }
+
+  fn header(&self) -> &'seg SegmentHeader {
     unsafe { &*(self.data.as_ptr() as *const _) }
   }
 
   fn remaining(&self) -> usize {
-    self.data.len() - self.segheader().tail.load(Ordering::Relaxed)
+    self.data.len() - self.header().tail.load(Ordering::Relaxed)
   }
 }
 
@@ -74,7 +94,7 @@ impl<'seg> Segment<'seg> {
 ///
 /// Values in here should only be written to by the writer thread but may be
 /// read by any thread.
-struct SegmentHeader {
+pub(crate) struct SegmentHeader<'seg> {
   /// Offset at which the next entry will be inserted.
   ///
   /// Always read this field using acquire loads to ensure that the inserted
@@ -84,25 +104,27 @@ struct SegmentHeader {
   /// Time at which this segment expires.
   expiry: AtomicU64,
 
-  /// Index of the next segment in the list.
-  next: AtomicUsize,
+  /// Next segment in the index.
+  next: WriterCell<Option<Segment<'seg>>>,
 }
 
-impl SegmentHeader {
-  fn reset(&self) {
+impl<'seg> SegmentHeader<'seg> {
+  fn reset(&self, token: &mut WriterToken) -> Option<Segment<'seg>> {
     self
       .tail
       .store(std::mem::size_of::<Self>(), Ordering::SeqCst);
     self.expiry.store(0, Ordering::SeqCst);
-    self.next.store(usize::MAX, Ordering::SeqCst);
+    std::mem::replace(self.next.get_mut(token), None)
   }
 }
 
-impl Default for SegmentHeader {
+impl Default for SegmentHeader<'_> {
   fn default() -> Self {
-    let me: Self = unsafe { std::mem::zeroed() };
-    me.reset();
-    me
+    Self {
+      tail: AtomicUsize::new(0),
+      expiry: AtomicU64::new(0),
+      next: WriterCell::new(None),
+    }
   }
 }
 
@@ -114,11 +136,11 @@ pub(crate) struct SegmentData<'seg> {
 
 impl<'seg> SegmentData<'seg> {
   pub(crate) fn new(data: &'seg mut [u8]) -> Self {
-    assert!(
+    assert_eq!(
       data
         .as_ptr()
-        .align_offset(std::mem::align_of::<SegmentHeader>())
-        == 0
+        .align_offset(std::mem::align_of::<SegmentHeader>()),
+      0
     );
 
     Self {
@@ -246,7 +268,7 @@ impl<'a, 'seg> Iterator for SegmentIter<'a, 'seg> {
   type Item = DataRef<'seg>;
 
   fn next(&mut self) -> Option<Self::Item> {
-    let tail = self.seg.segheader().tail.load(Ordering::Acquire);
+    let tail = self.seg.header().tail.load(Ordering::Acquire);
     let end = self.seg.data.as_ptr().wrapping_add(tail);
     if self.ptr >= end {
       return None;
