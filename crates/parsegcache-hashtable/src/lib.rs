@@ -225,8 +225,9 @@ where
     unsafe { self.reader.table.erase_by_entry(entry) }
   }
 
-  pub fn reader(&self) -> &Reader<T, S> {
-    &self.reader
+  /// Create a new reader.
+  pub fn reader(&self) -> Reader<T, S> {
+    self.reader.clone()
   }
 }
 
