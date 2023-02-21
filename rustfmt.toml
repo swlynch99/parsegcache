@@ -1,0 +1,11 @@
+tab_spaces = 2
+wrap_comments = true
+
+# rust-analyzer generally inserts use statements wherever so this standardizes
+# their order and granularity.
+imports_granularity = "module"
+group_imports = "stdexternalcrate"
+
+# Macro formatting
+format_macro_matchers = true
+format_macro_bodies = true
