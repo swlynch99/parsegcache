@@ -252,7 +252,7 @@ where
   ///
   /// This method is equivalent to a compare-and-swap internally. If you want an
   /// unconditional exchange operation you will need to use [`Writer::insert`].
-  pub fn update(&self, old: &T, new: T) -> bool {
+  pub fn update(&self, old: T, new: T) -> bool {
     self.table.update(old, new)
   }
 }
@@ -376,7 +376,7 @@ where
   /// Update the existing value in the hashtable only if it contains `old`.
   ///
   /// This method is equivalent to a compare-and-swap internally.
-  pub fn update(&self, old: &T, new: T) -> bool {
+  pub fn update(&self, old: T, new: T) -> bool {
     debug_assert!(
       old.key() == new.key(),
       "update passed values with different keys"
