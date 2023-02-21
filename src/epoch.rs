@@ -1,9 +1,12 @@
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use stable_vec::StableVec;
+
+use crate::util::IntCell;
 
 pub(crate) struct Collector<T> {
   shared: Arc<Shared>,
@@ -55,7 +58,7 @@ impl<T> Collector<T> {
     }
   }
 
-  pub fn collect(&mut self) -> Option<T> {
+  pub fn recycle(&mut self) -> Option<T> {
     let front = self.cleanup.front()?;
     if front.epoch < self.last_min {
       return self.cleanup.pop_front().map(|front| front.item);
@@ -80,6 +83,7 @@ impl<T> Collector<T> {
     Handle {
       shared: Arc::clone(&self.shared),
       entry: index,
+      pincnt: IntCell::new(0),
     }
   }
 
@@ -101,11 +105,30 @@ impl<T> Collector<T> {
 pub(crate) struct Handle {
   shared: Arc<Shared>,
   entry: usize,
+  pincnt: IntCell<usize>,
 }
 
 impl Handle {
-  pub(crate) fn pin(&mut self) -> EpochGuard {
+  pub(crate) fn pin(&self) -> EpochGuard {
     EpochGuard::new(self)
+  }
+}
+
+impl Clone for Handle {
+  fn clone(&self) -> Self {
+    let mut entries = self
+      .shared
+      .entries
+      .write()
+      .expect("entries lock was poisoned");
+
+    let index = entries.push(PaddedCounter(AtomicU64::new(1)));
+
+    Self {
+      shared: Arc::clone(&self.shared),
+      entry: index,
+      pincnt: IntCell::new(0),
+    }
   }
 }
 
@@ -123,42 +146,66 @@ impl Drop for Handle {
 
 pub(crate) struct EpochGuard<'h> {
   handle: &'h Handle,
+  _unsend: PhantomData<*mut ()>,
 }
 
 impl<'h> EpochGuard<'h> {
   fn new(handle: &'h Handle) -> Self {
-    let entries = handle
-      .shared
-      .entries
-      .read()
-      .expect("read lock was poisoned");
-    let entry = &entries[handle.entry];
+    let prevcnt = handle.pincnt.fetch_add(1);
 
-    let current = handle.shared.epoch.load(Ordering::Acquire);
-    let mut expected = entry.load(Ordering::Acquire);
+    if prevcnt == 0 {
+      let entries = handle
+        .shared
+        .entries
+        .read()
+        .expect("read lock was poisoned");
+      let entry = &entries[handle.entry];
 
-    loop {
-      match entry.compare_exchange(expected, current, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => break,
-        Err(val) => expected = val,
-      }
+      let current = handle.shared.epoch.load(Ordering::SeqCst);
+      entry.store(current, Ordering::SeqCst);
     }
 
-    Self { handle }
+    Self {
+      handle,
+      _unsend: PhantomData,
+    }
   }
 }
 
 impl<'h> Drop for EpochGuard<'h> {
   fn drop(&mut self) {
-    let entries = self
-      .handle
-      .shared
-      .entries
-      .read()
-      .expect("read lock was poisoned");
-    let entry = &entries[self.handle.entry];
+    let prevcnt = self.handle.pincnt.fetch_sub(1);
 
-    entry.fetch_or(1, Ordering::Release);
+    if prevcnt == 1 {
+      let entries = self
+        .handle
+        .shared
+        .entries
+        .read()
+        .expect("read lock was poisoned");
+      let entry = &entries[self.handle.entry];
+
+      entry.fetch_or(1, Ordering::Release);
+    }
+  }
+}
+
+pub struct EpochRef<'h, T> {
+  guard: EpochGuard<'h>,
+  value: T,
+}
+
+impl<'h, T> EpochRef<'h, T> {
+  pub(crate) fn new(guard: EpochGuard<'h>, value: T) -> Self {
+    Self { guard, value }
+  }
+}
+
+impl<'h, T> Deref for EpochRef<'h, T> {
+  type Target = T;
+
+  fn deref(&self) -> &Self::Target {
+    &self.value
   }
 }
 

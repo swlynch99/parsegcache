@@ -2,8 +2,14 @@
 
 use std::time::{Duration, SystemTime};
 
-pub(crate) struct TimerWheel {
-  buckets: Vec<usize>,
+pub(crate) trait WheelElement {
+  fn empty() -> Self;
+
+  fn is_empty(&self) -> bool;
+}
+
+pub(crate) struct TimerWheel<T> {
+  buckets: Vec<T>,
   head: usize,
 
   width: Duration,
@@ -11,9 +17,12 @@ pub(crate) struct TimerWheel {
   margin: Duration,
 }
 
-impl TimerWheel {
+impl<T> TimerWheel<T>
+where
+  T: Default,
+{
   /// Create a new timer wheel.
-  /// 
+  ///
   /// # Parameters
   /// - `span` - the total time span that the timer wheel will cover.
   /// - `bucket` - the time width covered by the bucket.
@@ -21,7 +30,8 @@ impl TimerWheel {
   pub(crate) fn new(span: Duration, bucket: Duration, margin: Duration) -> Self {
     let now = SystemTime::now();
     let nbuckets = (span.as_nanos() / bucket.as_nanos()) as usize;
-    let buckets = vec![usize::MAX; nbuckets];
+    let mut buckets = Vec::with_capacity(nbuckets);
+    buckets.resize_with(nbuckets, T::default);
 
     Self {
       buckets,
@@ -32,56 +42,43 @@ impl TimerWheel {
     }
   }
 
-  /// Reclaim existing segments that are about to expire.
+  /// Reclaim an existing segment that is about to expire.
   ///
   /// Returns the index to the segment contained in the bucket, if there is one.
-  pub(crate) fn reclaim(&mut self) -> Option<usize> {
+  pub(crate) fn reclaim(&mut self) -> Option<T> {
     let now = SystemTime::now();
 
     if now + self.margin <= self.start {
       return None;
     }
 
-    let current = std::mem::replace(&mut self.buckets[self.head], usize::MAX);
+    let current = std::mem::replace(&mut self.buckets[self.head], T::default());
     self.head = (self.head + 1) % self.buckets.len();
     self.start += self.width;
 
-    match current {
-      usize::MAX => None,
-      _ => Some(current),
-    }
+    Some(current)
   }
 
-  /// Erase the first hash bucket that contains a segment reference.
-  pub(crate) fn erase(&mut self) -> Option<usize> {
+  pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+    let (tail, head) = self.buckets.split_at(self.head);
+    head.iter().chain(tail.iter())
+  }
+
+  pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
     let (tail, head) = self.buckets.split_at_mut(self.head);
-
-    head
-      .iter_mut()
-      .chain(tail.iter_mut())
-      .filter(|bucket| **bucket != usize::MAX)
-      .map(|bucket| std::mem::replace(bucket, usize::MAX))
-      .next()
+    head.iter_mut().chain(tail.iter_mut())
   }
-
-  pub(crate) fn access<F>(&mut self, expiry: SystemTime, or_create: F) -> Option<usize>
-  where
-    F: FnOnce() -> Option<usize>,
-  {
+  
+  pub(crate) fn access(&mut self, expiry: SystemTime) -> Option<&mut T> {
     let span = expiry.duration_since(self.start).ok()?;
     if span < self.margin {
       return None;
     }
 
-    let bucket_idx = ((span.as_nanos() / self.width.as_nanos()) as usize)
-      .min(self.buckets.len());
+    let bucket_idx = ((span.as_nanos() / self.width.as_nanos()) as usize).min(self.buckets.len());
     let bucket_idx = (bucket_idx + self.head) % self.buckets.len();
     let bucket = &mut self.buckets[bucket_idx];
 
-    if *bucket == usize::MAX {
-      *bucket = or_create()?;
-    }
-
-    Some(*bucket)
+    Some(bucket)
   }
 }

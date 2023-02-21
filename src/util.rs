@@ -1,6 +1,7 @@
 //! Module for various utilities that are not part of the crate API.
 
-use std::cell::UnsafeCell;
+use std::cell::Cell;
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Sub};
 
 /// Struct to make writing a sequence of values out to raw memory easier.
 pub(crate) struct ByteWriter(*mut u8);
@@ -25,36 +26,42 @@ impl ByteWriter {
   }
 }
 
-pub(crate) struct WriterToken(());
+pub(crate) struct IntCell<T>(Cell<T>);
 
-impl WriterToken {
-  /// Create a new writer token.
-  /// 
-  /// # Safety
-  /// There should only be one writer token available at a time.
-  pub(crate) unsafe fn new() -> Self {
-    Self(())
+impl<T> IntCell<T> {
+  pub fn new(value: T) -> Self {
+    Self(Cell::new(value))
+  }
+
+  pub fn get_mut(&mut self) -> &mut T {
+    self.0.get_mut()
   }
 }
 
-/// Cell type that only allows access by the writer thread.
-#[derive(Default)]
-pub(crate) struct WriterCell<T> {
-  cell: UnsafeCell<T>,
+impl<T: Copy> IntCell<T> {
+  pub fn get(&self) -> T {
+    self.0.get()
+  }
+
+  pub fn replace(&self, val: T) -> T {
+    self.0.replace(val)
+  }
 }
 
-impl<T> WriterCell<T> {
-  pub(crate) fn new(value: T) -> Self {
-    Self {
-      cell: UnsafeCell::new(value),
+macro_rules! decl_fetch_op {
+  ($trait:ident, $tmethod:ident, $method:ident) => {
+    impl<T: Copy + $trait<Output = T>> IntCell<T> {
+      pub fn $method(&self, value: T) -> T {
+        self.replace($trait::$tmethod(self.get(), value))
+      }
     }
-  }
-
-  pub(crate) fn get<'c: 'v, 't: 'v, 'v>(&'c self, _token: &'t WriterToken) -> &'v T {
-    unsafe { &*self.cell.get() }
-  }
-
-  pub(crate) fn get_mut<'c: 'v, 't: 'v, 'v>(&'c self, _token: &'t mut WriterToken) -> &'v mut T {
-    unsafe { &mut *self.cell.get() }
-  }
+  };
 }
+
+decl_fetch_op!(Add, add, fetch_add);
+decl_fetch_op!(Sub, sub, fetch_sub);
+decl_fetch_op!(Mul, mul, fetch_mul);
+decl_fetch_op!(Div, div, fetch_div);
+decl_fetch_op!(BitAnd, bitand, fetch_and);
+decl_fetch_op!(BitOr, bitor, fetch_or);
+decl_fetch_op!(BitXor, bitxor, fetch_xor);

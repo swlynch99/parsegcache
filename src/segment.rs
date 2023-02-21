@@ -1,8 +1,10 @@
+use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime};
 
-use crate::util::{ByteWriter, WriterCell, WriterToken};
+use crate::util::ByteWriter;
 
 pub(crate) struct Segment<'seg> {
   data: SegmentData<'seg>,
@@ -22,10 +24,7 @@ impl<'seg> Segment<'seg> {
 
   /// Insert a new value into this segment. On success, returns a [`DataRef`]
   /// for the key-value pair.
-  ///
-  /// # Safety
-  /// This method may only be called from the writer thread.
-  pub(crate) unsafe fn insert(&self, key: &[u8], value: &[u8]) -> Option<DataRef<'seg>> {
+  pub(crate) fn insert(&mut self, key: &[u8], value: &[u8]) -> Option<DataRef<'seg>> {
     let header = EntryHeader {
       klen: key.len(),
       vlen: value.len(),
@@ -57,31 +56,68 @@ impl<'seg> Segment<'seg> {
     }
   }
 
-  pub(crate) fn iter(&self) -> SegmentIter<'_, 'seg> {
-    SegmentIter::new(self)
+  /// Undo the previous insertion.
+  ///
+  /// # Safety
+  /// The [`DataRef`] passed in must have been the one returned by the prevous
+  /// [`insert`](Self::insert) call to have been made on this segment.
+  ///
+  /// The [`DataRef`] instance must also not be accessed after calling this
+  /// method.
+  pub(crate) unsafe fn uninsert(&mut self, data: DataRef<'seg>) {
+    let seghdr = self.header();
+    let step_len = data.step_len();
+
+    let tail = seghdr.tail.fetch_sub(step_len, Ordering::AcqRel) - step_len;
+    let tail_ptr = self.data.as_ptr().wrapping_add(tail);
+
+    assert_eq!(
+      tail_ptr,
+      data.as_ptr(),
+      "data was not at the end of this segment"
+    );
   }
 
-  pub(crate) fn is_tail(&self, token: &WriterToken) -> bool {
-    self.header().next.get(token).is_none()
+  pub(crate) fn iter(&self) -> EntryIter<'_, 'seg> {
+    EntryIter::new(self)
+  }
+
+  pub(crate) fn next_segment_mut(&mut self) -> Option<&mut Segment<'seg>> {
+    unsafe { (*self.header().next.get()).as_mut() }
+  }
+
+  pub(crate) unsafe fn next_segment(&self) -> Option<&Segment<'seg>> {
+    (*self.header().next.get()).as_ref()
+  }
+
+  pub(crate) fn take_next(&mut self) -> Option<Segment<'seg>> {
+    unsafe { &mut *self.header().next.get() }.take()
+  }
+
+  pub(crate) fn is_tail(&self) -> bool {
+    unsafe { self.next_segment().is_none() }
   }
 
   /// Extend this segment with another one.
   ///
   /// # Panics
   /// Panics if this segment already has a next segment.
-  pub(crate) fn extend(&self, next: Segment<'seg>, token: &mut WriterToken) {
-    let prev = std::mem::replace(self.header().next.get_mut(token), Some(next));
-    assert!(prev.is_none());
+  pub(crate) fn extend<'a>(&'a mut self, next: Segment<'seg>) -> &'a mut Segment<'seg> {
+    let next_ref = unsafe { &mut *self.header().next.get() };
+    assert!(next_ref.is_none());
+
+    *next_ref = Some(next);
+    next_ref.as_mut().unwrap()
   }
 
   /// Reset this segment back to a blank state.
-  /// 
+  ///
   /// Returns the next segment in the list, if there is one.
-  pub(crate) fn reset(&self, token: &mut WriterToken) -> Option<Segment<'seg>> {
-    self.header().reset(token)
+  pub(crate) fn reset(&mut self, expiry: SystemTime) -> Option<Segment<'seg>> {
+    unsafe { self.header().reset(expiry) }
   }
 
-  fn header(&self) -> &'seg SegmentHeader {
+  fn header(&self) -> &'seg SegmentHeader<'seg> {
     unsafe { &*(self.data.as_ptr() as *const _) }
   }
 
@@ -105,16 +141,29 @@ pub(crate) struct SegmentHeader<'seg> {
   expiry: AtomicU64,
 
   /// Next segment in the index.
-  next: WriterCell<Option<Segment<'seg>>>,
+  next: UnsafeCell<Option<Segment<'seg>>>,
 }
 
 impl<'seg> SegmentHeader<'seg> {
-  fn reset(&self, token: &mut WriterToken) -> Option<Segment<'seg>> {
+  unsafe fn reset(&self, expiry: SystemTime) -> Option<Segment<'seg>> {
+    let ts = expiry
+      .duration_since(SystemTime::UNIX_EPOCH)
+      .unwrap()
+      .as_millis()
+      .try_into()
+      .expect("Timestamp as milliseconds was larger than a u64");
+
     self
       .tail
       .store(std::mem::size_of::<Self>(), Ordering::SeqCst);
-    self.expiry.store(0, Ordering::SeqCst);
-    std::mem::replace(self.next.get_mut(token), None)
+    self.expiry.store(ts, Ordering::SeqCst);
+    std::mem::replace(&mut *self.next.get(), None)
+  }
+
+  pub(crate) fn expiry(&self) -> SystemTime {
+    let expiry = self.expiry.load(Ordering::SeqCst);
+    let expiry = Duration::from_millis(expiry);
+    SystemTime::UNIX_EPOCH + expiry
   }
 }
 
@@ -123,7 +172,7 @@ impl Default for SegmentHeader<'_> {
     Self {
       tail: AtomicUsize::new(0),
       expiry: AtomicU64::new(0),
-      next: WriterCell::new(None),
+      next: UnsafeCell::new(None),
     }
   }
 }
@@ -163,6 +212,8 @@ impl<'seg> SegmentData<'seg> {
   }
 }
 
+unsafe impl Send for SegmentData<'_> {}
+
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct EntryHeader {
   klen: usize,
@@ -195,7 +246,7 @@ impl EntryHeader {
 /// - the bytes for the key
 /// - the bytes for the value
 #[derive(Copy, Clone)]
-pub(crate) struct DataRef<'seg> {
+pub struct DataRef<'seg> {
   ptr: NonNull<u8>,
   _phantom: PhantomData<&'seg [u8]>,
 }
@@ -246,14 +297,18 @@ impl<'seg> DataRef<'seg> {
     let ptr = unsafe { self.data_ptr().add(header.klen()) };
     unsafe { std::slice::from_raw_parts(ptr, header.vlen()) }
   }
+
+  pub(crate) fn step_len(&self) -> usize {
+    self.header().step_len()
+  }
 }
 
-pub(crate) struct SegmentIter<'a, 'seg> {
+pub(crate) struct EntryIter<'a, 'seg> {
   ptr: *const u8,
   seg: &'a Segment<'seg>,
 }
 
-impl<'a, 'seg> SegmentIter<'a, 'seg> {
+impl<'a, 'seg> EntryIter<'a, 'seg> {
   fn new(seg: &'a Segment<'seg>) -> Self {
     let ptr = seg
       .data
@@ -264,7 +319,7 @@ impl<'a, 'seg> SegmentIter<'a, 'seg> {
   }
 }
 
-impl<'a, 'seg> Iterator for SegmentIter<'a, 'seg> {
+impl<'a, 'seg> Iterator for EntryIter<'a, 'seg> {
   type Item = DataRef<'seg>;
 
   fn next(&mut self) -> Option<Self::Item> {

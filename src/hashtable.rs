@@ -119,9 +119,12 @@ const EMPTY_TAG: u32 = 0;
 
 #[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
-pub(crate) enum InsertError {
+pub enum CommandError {
   #[error("no backing memory capacity available to insert into hashtable")]
   NoCapacity,
+
+  #[error("the cache writer thread has shut down")]
+  NoWriter
 }
 
 pub(crate) struct HashTable<'seg, S = RandomState> {
@@ -259,7 +262,7 @@ where
   pub(crate) unsafe fn insert(
     &self,
     data: DataRef<'seg>,
-  ) -> Result<Option<DataRef<'seg>>, InsertError> {
+  ) -> Result<Option<DataRef<'seg>>, CommandError> {
     let hash = self.hash(data.key());
     let tag = (hash >> 32) as u32;
     let index = (hash as usize) & (self.buckets.len() - 1);
@@ -336,6 +339,38 @@ where
 
     None
   }
+
+  /// Erase an entry from the hashtable only if it matches the exact entry here.
+  /// 
+  /// # Safety
+  /// It is only valid to call this function from the writer thread.
+  pub(crate) unsafe fn erase_by_entry(&self, entry: DataRef<'seg>) -> bool {
+    let (tag, index) = self.hash_tag(entry.key());
+
+    let mut iter = BucketIter::new(self, index);
+    while let Some((ktag, value)) = iter.next() {
+      if tag != ktag.load(Ordering::SeqCst) {
+        continue;
+      }
+
+      let elem = value.load(Ordering::SeqCst);
+      let data = match unsafe { DataRef::new(elem) } {
+        Some(data) => data,
+        None => continue,
+      };
+
+      if data.as_ptr() != entry.as_ptr() {
+        continue;
+      }
+
+      ktag.store(EMPTY_TAG, Ordering::SeqCst);
+      value.store(std::ptr::null_mut(), Ordering::SeqCst);
+
+      return true;
+    }
+
+    return false;
+  }
 }
 
 impl Bucket {
@@ -411,7 +446,7 @@ impl<'tbl, 'seg, S> BucketIter<'tbl, 'seg, S> {
   pub(crate) fn new_extend(
     table: &'tbl HashTable<'seg, S>,
     index: usize,
-  ) -> Result<Self, InsertError> {
+  ) -> Result<Self, CommandError> {
     let bucket_var = &table.buckets[index];
     let bucket_idx = bucket_var.load(Ordering::SeqCst);
 
@@ -427,7 +462,7 @@ impl<'tbl, 'seg, S> BucketIter<'tbl, 'seg, S> {
 
           bucket.downgrade()
         }
-        None => return Err(InsertError::NoCapacity),
+        None => return Err(CommandError::NoCapacity),
       },
       index => match table.storage.get(index) {
         Some(bucket) => bucket,
@@ -445,7 +480,7 @@ impl<'tbl, 'seg, S> BucketIter<'tbl, 'seg, S> {
   /// Step to the next key-value slot, allocating a new bucket if necessary.
   ///
   /// This function should only be called from the write thread.
-  pub(crate) fn next_extend(&mut self) -> Result<(&AtomicU32, &AtomicPtr<u8>), InsertError> {
+  pub(crate) fn next_extend(&mut self) -> Result<(&AtomicU32, &AtomicPtr<u8>), CommandError> {
     loop {
       let bucket = self
         .bucket
@@ -459,7 +494,7 @@ impl<'tbl, 'seg, S> BucketIter<'tbl, 'seg, S> {
               bucket.next.store(next.key(), Ordering::SeqCst);
               next.downgrade()
             }
-            None => return Err(InsertError::NoCapacity),
+            None => return Err(CommandError::NoCapacity),
           },
           index => match self.table.storage.get(index) {
             Some(bucket) => bucket,
