@@ -13,3 +13,9 @@ oneshot = { version = "0.1.5", features = ["async"] }
 sharded-slab = "0.1.4"
 stable-vec = "0.4.0"
 thiserror = "1.0.37"
+
+[workspace]
+members = [
+  ".",
+  "crates/parsegcache-hashtable",
+]

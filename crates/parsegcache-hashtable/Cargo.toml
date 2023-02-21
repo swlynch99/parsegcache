@@ -1,0 +1,9 @@
+[package]
+name = "parsegcache-hashtable"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memoffset = "0.8.0"
+thiserror = "1.0"
+sharded-slab = "0.1.4"
