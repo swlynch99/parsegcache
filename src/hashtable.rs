@@ -124,7 +124,7 @@ pub enum CommandError {
   NoCapacity,
 
   #[error("the cache writer thread has shut down")]
-  NoWriter
+  NoWriter,
 }
 
 pub(crate) struct HashTable<'seg, S = RandomState> {
@@ -341,7 +341,7 @@ where
   }
 
   /// Erase an entry from the hashtable only if it matches the exact entry here.
-  /// 
+  ///
   /// # Safety
   /// It is only valid to call this function from the writer thread.
   pub(crate) unsafe fn erase_by_entry(&self, entry: DataRef<'seg>) -> bool {

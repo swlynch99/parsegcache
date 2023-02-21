@@ -68,7 +68,7 @@ where
     let (tail, head) = self.buckets.split_at_mut(self.head);
     head.iter_mut().chain(tail.iter_mut())
   }
-  
+
   pub(crate) fn access(&mut self, expiry: SystemTime) -> Option<&mut T> {
     let span = expiry.duration_since(self.start).ok()?;
     if span < self.margin {

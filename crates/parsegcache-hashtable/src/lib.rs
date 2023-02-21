@@ -103,6 +103,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -154,6 +155,16 @@ pub enum CommandError {
   NoWriter,
 }
 
+#[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
+#[error("no backing memory capacity available to insert into the hashtable")]
+pub struct CapacityError;
+
+impl From<CapacityError> for CommandError {
+  fn from(_: CapacityError) -> Self {
+    Self::NoCapacity
+  }
+}
+
 pub struct Writer<T, S>
 where
   T: RawEntry,
@@ -164,9 +175,44 @@ where
 impl<T, S> Writer<T, S>
 where
   T: RawEntry,
-  
+  S: BuildHasher,
 {
-  
+  /// Insert a value into the hashtable.
+  ///
+  /// If there is a value with the same key in the hashtable then it will be
+  /// replaced and returned. If the table has no capacity then an error will be
+  /// returned.
+  pub fn insert(&mut self, data: T) -> Result<Option<T>, CapacityError> {
+    unsafe { self.reader.table.insert(data) }
+  }
+
+  /// Erase an existing value from the hashtable by its key.
+  ///
+  /// Returns the value contained in the hash table, or `None` if no value was
+  /// present.
+  pub fn erase(&mut self, key: &T::Key) -> Option<T> {
+    unsafe { self.reader.table.erase(key) }
+  }
+
+  /// Erase an entry from the hash table only if it matches the exact entry
+  /// here.
+  ///
+  /// This will erase an entry in the table if it has the same pointer
+  /// representation as `entry`. Returns true if an entry was erased.
+  pub fn erase_by_entry(&mut self, entry: T) -> bool {
+    unsafe { self.reader.table.erase_by_entry(entry) }
+  }
+}
+
+impl<T, S> Deref for Writer<T, S>
+where
+  T: RawEntry,
+{
+  type Target = Reader<T, S>;
+
+  fn deref(&self) -> &Self::Target {
+    &self.reader
+  }
 }
 
 pub struct Reader<T, S>
@@ -181,10 +227,15 @@ where
   T: RawEntry,
   S: BuildHasher,
 {
+  /// Read a value from the hashtable, if present.
   pub fn get(&self, key: &T::Key) -> Option<T> {
     self.table.get(key)
   }
 
+  /// Update the existing value in the hash table only if it contains `old`.
+  ///
+  /// This method is equivalent to a compare-and-swap internally. If you want an
+  /// unconditional exchange operation you will need to use [`Writer::insert`].
   pub fn update(&self, old: &T, new: T) -> bool {
     self.table.update(old, new)
   }
@@ -192,10 +243,12 @@ where
 
 impl<T, S> Clone for Reader<T, S>
 where
-  T: RawEntry
+  T: RawEntry,
 {
   fn clone(&self) -> Self {
-    Self { table: self.table.clone() }
+    Self {
+      table: self.table.clone(),
+    }
   }
 }
 
@@ -336,7 +389,7 @@ where
   ///
   /// # Safety
   /// It is only valid to call this function from the writer thread.
-  pub unsafe fn insert(&self, data: T) -> Result<Option<T>, CommandError> {
+  pub unsafe fn insert(&self, data: T) -> Result<Option<T>, CapacityError> {
     let hash = self.hash(data.key());
     let tag = (hash >> 32) as u32;
     let index = (hash as usize) & (self.buckets.len() - 1);
@@ -523,7 +576,7 @@ where
   /// Creates a new iterator, allocating a new bucket if necessary.
   ///
   /// This function should only be called from the write thread.
-  pub fn new_extend(table: &'tbl HashTable<T, S>, index: usize) -> Result<Self, CommandError> {
+  pub fn new_extend(table: &'tbl HashTable<T, S>, index: usize) -> Result<Self, CapacityError> {
     let bucket_var = &table.buckets[index];
     let bucket_idx = bucket_var.load(Ordering::SeqCst);
 
@@ -539,7 +592,7 @@ where
 
           bucket.downgrade()
         }
-        None => return Err(CommandError::NoCapacity),
+        None => return Err(CapacityError),
       },
       index => match table.storage.get(index) {
         Some(bucket) => bucket,
@@ -557,7 +610,7 @@ where
   /// Step to the next key-value slot, allocating a new bucket if necessary.
   ///
   /// This function should only be called from the write thread.
-  pub fn next_extend(&mut self) -> Result<(&AtomicU32, &AtomicPtr<T::Target>), CommandError> {
+  pub fn next_extend(&mut self) -> Result<(&AtomicU32, &AtomicPtr<T::Target>), CapacityError> {
     loop {
       let bucket = self
         .bucket
@@ -571,7 +624,7 @@ where
               bucket.next.store(next.key(), Ordering::SeqCst);
               next.downgrade()
             }
-            None => return Err(CommandError::NoCapacity),
+            None => return Err(CapacityError),
           },
           index => match self.table.storage.get(index) {
             Some(bucket) => bucket,

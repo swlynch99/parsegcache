@@ -97,7 +97,11 @@ impl<'seg> CacheWriter<'seg> {
           }
           CacheCommand::Delete { key, chan } => {
             let value = self.delete(&key).map(|data| data.value().to_vec());
-            let _ = chan.send(UpdateResponse { key, val: value, err: None });
+            let _ = chan.send(UpdateResponse {
+              key,
+              val: value,
+              err: None,
+            });
           }
         }
 
