@@ -104,6 +104,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::sync::atomic::AtomicU64;
 
 use sharded_slab::pool::Ref;
 use sharded_slab::{Clear, Pool};
@@ -117,17 +118,19 @@ pub use crate::entry::{Entry, RawEntry};
 
 #[cfg(feature = "loom")]
 mod atomics {
-  pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+  pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
   pub(crate) use loom::sync::Arc;
 }
 
 #[cfg(not(feature = "loom"))]
 mod atomics {
-  pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+  pub(crate) use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
   pub(crate) use std::sync::Arc;
 }
 
-const BUCKET_ELEMS: usize = (64 - std::mem::size_of::<usize>()) / std::mem::size_of::<u32>();
+const CACHE_LINE: usize = 64;
+const BUCKET_ELEMS: usize =
+  (CACHE_LINE - std::mem::size_of::<usize>()) / std::mem::size_of::<u32>();
 const INVALID_BUCKET_IDX: usize = usize::MAX;
 const EMPTY_TAG: u32 = 0;
 
@@ -280,23 +283,15 @@ where
 unsafe impl<T, S> Send for HashTable<T, S>
 where
   T: RawEntry + Send,
-  S: Send
-{}
+  S: Send,
+{
+}
 
 unsafe impl<T, S> Sync for HashTable<T, S>
 where
   T: RawEntry + Sync,
-  S: Sync
-{}
-
-#[repr(C, align(64))]
-struct Bucket<T> {
-  keys: [AtomicU32; BUCKET_ELEMS],
-  next: AtomicUsize,
-  /// # Validity Invariant
-  /// Each element will always either be null or point to a valid DataRef
-  /// instance.
-  values: [AtomicPtr<T>; BUCKET_ELEMS],
+  S: Sync,
+{
 }
 
 impl<T, S> HashTable<T, S>
@@ -483,7 +478,7 @@ where
         continue;
       }
 
-      ktag.store(EMPTY_TAG, Ordering::SeqCst);
+      ktag.clear(Ordering::SeqCst);
       value.store(std::ptr::null_mut(), Ordering::SeqCst);
 
       return Some(data);
@@ -515,7 +510,7 @@ where
         continue;
       }
 
-      ktag.store(EMPTY_TAG, Ordering::SeqCst);
+      ktag.clear(Ordering::SeqCst);
       value.store(std::ptr::null_mut(), Ordering::SeqCst);
 
       return true;
@@ -525,10 +520,20 @@ where
   }
 }
 
+#[repr(C, align(64))]
+struct Bucket<T> {
+  next: AtomicUsize,
+  keys: AtomicU32Array<{ BUCKET_ELEMS / 2 }>,
+  /// # Validity Invariant
+  /// Each element will always either be null or point to a valid DataRef
+  /// instance.
+  values: [AtomicPtr<T>; BUCKET_ELEMS],
+}
+
 impl<T> Bucket<T> {
   pub fn new() -> Self {
     Self {
-      keys: std::array::from_fn(|_| AtomicU32::new(EMPTY_TAG)),
+      keys: AtomicU32Array::new(),
       next: AtomicUsize::new(usize::MAX),
       values: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
     }
@@ -570,7 +575,7 @@ where
     }
   }
 
-  pub fn next(&mut self) -> Option<(&AtomicU32, &AtomicPtr<T::Target>)> {
+  pub fn next(&mut self) -> Option<(AtomicU32Proxy, &AtomicPtr<T::Target>)> {
     loop {
       let bucket = self.bucket.as_ref()?;
 
@@ -580,7 +585,7 @@ where
         self.index = 0;
         self.bucket = self.table.storage.get(bucket_idx);
       } else {
-        let vals = (&bucket.keys[self.index], &bucket.values[self.index]);
+        let vals = (bucket.keys.get(self.index), &bucket.values[self.index]);
         self.index += 1;
 
         // Extend the lifetime of vals to avoid a borrow checker error.
@@ -632,7 +637,7 @@ where
   /// Step to the next key-value slot, allocating a new bucket if necessary.
   ///
   /// This function should only be called from the write thread.
-  pub fn next_extend(&mut self) -> Result<(&AtomicU32, &AtomicPtr<T::Target>), CapacityError> {
+  pub fn next_extend(&mut self) -> Result<(AtomicU32Proxy, &AtomicPtr<T::Target>), CapacityError> {
     loop {
       let bucket = self
         .bucket
@@ -657,7 +662,7 @@ where
         self.index = 0;
         self.bucket = Some(next);
       } else {
-        let vals = (&bucket.keys[self.index], &bucket.values[self.index]);
+        let vals = (bucket.keys.get(self.index), &bucket.values[self.index]);
         self.index += 1;
 
         // Extend the lifetime of vals to avoid a borrow checker error.
@@ -683,7 +688,75 @@ where
   }
 }
 
+struct AtomicU32Array<const HN: usize> {
+  data: [AtomicU64; HN],
+}
+
+impl<const HN: usize> AtomicU32Array<HN> {
+  const N: usize = HN * 2;
+
+  const fn new() -> Self {
+    const EMPTY_VAL: AtomicU64 = AtomicU64::new((EMPTY_TAG as u64) | ((EMPTY_TAG as u64) << 32));
+
+    Self {
+      data: [EMPTY_VAL; HN],
+    }
+  }
+
+  fn get(&self, index: usize) -> AtomicU32Proxy {
+    assert!(
+      index < Self::N,
+      "index was out of bounds: {index} >= {}",
+      Self::N
+    );
+
+    let (index, half) = (index / 2, index % 2 == 1);
+
+    AtomicU32Proxy {
+      value: &self.data[index],
+      half,
+    }
+  }
+}
+
+struct AtomicU32Proxy<'a> {
+  value: &'a AtomicU64,
+  half: bool,
+}
+
+impl AtomicU32Proxy<'_> {
+  fn mask(&self) -> u64 {
+    match self.half {
+      true => (u32::MAX as u64) << 32,
+      false => u32::MAX as u64,
+    }
+  }
+
+  fn shift(&self) -> u64 {
+    match self.half {
+      true => 32,
+      false => 0,
+    }
+  }
+
+  fn load(&self, ordering: Ordering) -> u32 {
+    (self.value.load(ordering) >> self.shift()) as u32
+  }
+
+  fn clear(&self, ordering: Ordering) {
+    self.value.fetch_and(!self.mask(), ordering);
+  }
+
+  fn store(&self, value: u32, ordering: Ordering) {
+    debug_assert_eq!(self.load(Ordering::Relaxed), 0);
+    self
+      .value
+      .fetch_or((value as u64) << self.shift(), ordering);
+  }
+}
+
 #[test]
 fn test_bucket_field_offsets() {
-  assert_eq!(memoffset::offset_of!(Bucket<*const ()>, values), 64);
+  assert_eq!(memoffset::offset_of!(Bucket<u64>, values), CACHE_LINE);
+  assert_eq!(memoffset::offset_of!(Bucket<*const ()>, values), CACHE_LINE);
 }
