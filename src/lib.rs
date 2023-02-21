@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -42,8 +41,8 @@ pub struct CacheConfig {
 }
 
 pub struct Entry<'seg> {
-  data: DataRef<'seg>,
-  expiry: SystemTime,
+  pub(crate) data: DataRef<'seg>,
+  pub(crate) expiry: SystemTime,
 }
 
 impl<'seg> Entry<'seg> {
@@ -76,27 +75,48 @@ struct WriterDetail {
 pub struct Writer(WriterDetail);
 
 impl Writer {
+  /// Fetch an entry from the cache, if present.
   pub fn get(&self, key: &[u8]) -> Option<Entry> {
     self.0.with_cache(|cache| cache.get(key))
   }
 
+  /// Set an entry within the cache.
+  /// 
+  /// Returns the previous entry within the cache, or an error if there was no
+  /// capacity to insert the new entry into the cache.
   pub fn set(
     &mut self,
     key: &[u8],
     value: &[u8],
     expiry: SystemTime,
-  ) -> Result<DataRef, CapacityError> {
+  ) -> Result<Option<Entry>, CapacityError> {
     self.0.with_cache_mut(|cache| cache.set(key, value, expiry))
   }
 
-  pub fn delete(&mut self, key: &[u8]) -> Option<DataRef> {
+  /// Delete an entry from the cache.
+  /// 
+  /// Returns the deleted entry, if one was present within the cache.
+  pub fn delete(&mut self, key: &[u8]) -> Option<Entry> {
     self.0.with_cache_mut(|cache| cache.delete(key))
   }
 
+  /// Perform background cleanup tasks on the cache.
+  /// 
+  /// This includes
+  /// - removing entries that have expired,
+  /// - (in the future) evicting cache entries when free space is low, and,
+  /// - garbage collecting expired segments that are no longer referenced by a
+  ///   reader thread.
+  /// 
+  /// It is recommended to call expire frequently. Ideally it would be called
+  /// after every command and periodically if no commands are being issued to
+  /// the `Writer`. Under the default config, `expire` is a lightweight and
+  /// time-bounded operation and so it should be fine to call it frequently.
   pub fn expire(&mut self) {
     self.0.with_cache_mut(|cache| cache.expire())
   }
 
+  /// Create a new reader for this cache.
   pub fn reader(&mut self) -> Reader {
     let data = self.0.borrow_data().clone();
 
@@ -105,6 +125,7 @@ impl Writer {
       .with_cache_mut(move |cache| Reader::new(data, cache.reader()))
   }
 
+  /// Get the config that was used to construct this cache.
   pub fn config(&self) -> &CacheConfig {
     self.0.with_cache(|cache| cache.config())
   }

@@ -12,6 +12,11 @@ use crate::{CacheConfig, Entry};
 
 const CACHE_LINE: usize = 64;
 
+pub(crate) enum WriteError {
+  ExpiryInPast,
+  CapacityError,
+}
+
 pub(crate) struct CacheWriter<'seg> {
   wheel: TimerWheel<TimeBucket<'seg>>,
   freelist: CacheFreelist<'seg>,
@@ -61,25 +66,45 @@ impl<'seg> CacheWriter<'seg> {
     key: &[u8],
     value: &[u8],
     expiry: SystemTime,
-  ) -> Result<DataRef<'seg>, CapacityError> {
-    let data = self.write(key, value, expiry).ok_or(CapacityError)?;
+  ) -> Result<Option<Entry<'seg>>, CapacityError> {
+    let entry = match self.write(key, value, expiry) {
+      Ok(entry) => entry,
+      Err(WriteError::ExpiryInPast) => {
+        self.delete(key);
+        return Ok(None);
+      }
+      Err(WriteError::CapacityError) => return Err(CapacityError),
+    };
 
-    match self.hashtable.insert(data) {
-      Ok(Some(prev)) => self.on_erase(prev),
-      Ok(None) => (),
+    match self.hashtable.insert(entry.data) {
+      Ok(Some(prev)) => {
+        let expiry = self.shared.expiry_for(prev);
+        self.on_erase(prev);
+
+        if expiry < SystemTime::now() {
+          return Ok(None);
+        }
+
+        Ok(Some(Entry::new(prev, expiry)))
+      },
+      Ok(None) => Ok(None),
       Err(e) => {
-        self.on_erase(data);
+        self.on_erase(entry.data);
         return Err(e);
       }
     }
-
-    Ok(data)
   }
 
-  pub fn delete(&mut self, key: &[u8]) -> Option<DataRef<'seg>> {
+  pub fn delete(&mut self, key: &[u8]) -> Option<Entry<'seg>> {
     let data = self.hashtable.erase(key)?;
+    let expiry = self.shared.expiry_for(data);
     self.on_erase(data);
-    Some(data)
+
+    if expiry < SystemTime::now() {
+      return None;
+    }
+
+    Some(Entry::new(data, expiry))
   }
 
   pub fn expire(&mut self) {
@@ -128,11 +153,21 @@ impl<'seg> CacheWriter<'seg> {
     }
   }
 
-  fn write(&mut self, key: &[u8], value: &[u8], expiry: SystemTime) -> Option<DataRef<'seg>> {
-    let bucket = self.wheel.get_mut(expiry)?;
+  fn write(
+    &mut self,
+    key: &[u8],
+    value: &[u8],
+    expiry: SystemTime,
+  ) -> Result<Entry<'seg>, WriteError> {
+    let bucket = self.wheel.get_mut(expiry).ok_or(WriteError::ExpiryInPast)?;
     let segment = match &mut bucket.segment {
       Some(segment) => segment,
-      segment => segment.get_or_insert(self.freelist.next_free(expiry)?),
+      segment => segment.get_or_insert(
+        self
+          .freelist
+          .next_free(expiry)
+          .ok_or(WriteError::CapacityError)?,
+      ),
     };
 
     loop {
@@ -140,12 +175,15 @@ impl<'seg> CacheWriter<'seg> {
         bucket.allocated += data.step_len();
         bucket.stored += data.step_len();
 
-        break Some(data);
+        return Ok(Entry::new(data, self.shared.expiry_for(data)));
       }
 
       // Prepend the segment to the freelist so we don't do an unbounded
       // traversal.
-      let next = self.freelist.next_free(expiry)?;
+      let next = self
+        .freelist
+        .next_free(expiry)
+        .ok_or(WriteError::CapacityError)?;
       let prev = std::mem::replace(segment, next);
       segment.extend(prev);
     }
