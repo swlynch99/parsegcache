@@ -111,7 +111,7 @@ const BUCKET_ELEMS: usize = (64 - std::mem::size_of::<usize>()) / std::mem::size
 const INVALID_BUCKET_IDX: usize = usize::MAX;
 const EMPTY_TAG: u32 = 0;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum InsertError {
   #[error("no backing memory capacity available to insert into hashtable")]
@@ -177,11 +177,17 @@ where
     hash
   }
 
-  /// Read a value from the hashtable, if present.
-  pub(crate) fn get(&self, key: &[u8]) -> Option<DataRef<'seg>> {
+  fn hash_tag(&self, key: &[u8]) -> (u32, usize) {
     let hash = self.hash(key);
     let tag = (hash >> 32) as u32;
     let index = (hash as usize) & (self.buckets.len() - 1);
+
+    (tag, index)
+  }
+
+  /// Read a value from the hashtable, if present.
+  pub(crate) fn get(&self, key: &[u8]) -> Option<DataRef<'seg>> {
+    let (tag, index) = self.hash_tag(key);
 
     let mut iter = BucketIter::new(self, index);
     while let Some((ktag, value)) = iter.next() {
@@ -205,6 +211,38 @@ where
     }
 
     None
+  }
+
+  /// Update the existing value in the hashtable only if it contains `old`.
+  ///
+  /// This method is equivalent to a compare-and-swap internally.
+  pub(crate) fn update(&self, old: DataRef<'seg>, new: DataRef<'seg>) -> bool {
+    debug_assert_eq!(
+      old.key(),
+      new.key(),
+      "update passed values with different keys"
+    );
+
+    let (tag, index) = self.hash_tag(new.key());
+
+    let mut iter = BucketIter::new(self, index);
+    while let Some((ktag, value)) = iter.next() {
+      if tag != ktag.load(Ordering::SeqCst) {
+        continue;
+      }
+
+      match value.compare_exchange(
+        old.as_ptr() as _,
+        new.as_ptr() as _,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+      ) {
+        Ok(_) => return true,
+        Err(_) => continue,
+      }
+    }
+
+    return false;
   }
 
   /// Insert a value into the hashtable, replacing any existing value with the
