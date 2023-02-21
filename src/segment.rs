@@ -1,15 +1,31 @@
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::util::ByteWriter;
 
 pub(crate) struct Segment<'seg> {
   data: SegmentData<'seg>,
-  tail: usize,
 }
 
 impl<'seg> Segment<'seg> {
-  pub(crate) fn insert(&mut self, key: &[u8], value: &[u8]) -> Option<DataRef<'seg>> {
+  pub(crate) fn new(data: &'seg mut [u8]) -> Self {
+    assert!(data.len() >= std::mem::size_of::<SegmentHeader>());
+
+    let mut data = SegmentData::new(data);
+    unsafe {
+      std::ptr::write(data.as_mut_ptr() as _, SegmentHeader::default());
+    }
+
+    Self { data }
+  }
+
+  /// Insert a new value into this segment. On success, returns a [`DataRef`]
+  /// for the key-value pair.
+  /// 
+  /// # Safety
+  /// This method may only be called from the writer thread.
+  pub(crate) unsafe fn insert(&self, key: &[u8], value: &[u8]) -> Option<DataRef<'seg>> {
     let header = EntryHeader {
       klen: key.len(),
       vlen: value.len(),
@@ -19,14 +35,23 @@ impl<'seg> Segment<'seg> {
       return None;
     }
 
+    let seghdr = self.segheader();
+
     unsafe {
-      let ptr = self.write_ptr();
-      self.tail += header.step_len();
+      let tail = seghdr.tail.load(Ordering::Relaxed);
+      // We are only writing to a range that is not being written to by anyone else so
+      // this is safe.
+      let ptr = self.data.as_ptr().wrapping_add(tail) as *mut _;
 
       let mut writer = ByteWriter::new(ptr);
       writer.write(header);
       writer.write_bytes(key);
       writer.write_bytes(value);
+
+      // The release store will synchronize with future acquire stores of tail.
+      seghdr
+        .tail
+        .store(tail + header.step_len(), Ordering::Release);
 
       Some(DataRef::from_ptr(ptr))
     }
@@ -36,12 +61,48 @@ impl<'seg> Segment<'seg> {
     SegmentIter::new(self)
   }
 
-  fn write_ptr(&mut self) -> *mut u8 {
-    unsafe { self.data.as_mut_ptr().add(self.tail) }
+  fn segheader(&self) -> &'seg SegmentHeader {
+    unsafe { &*(self.data.as_ptr() as *const _) }
   }
 
   fn remaining(&self) -> usize {
-    self.data.len() - self.tail
+    self.data.len() - self.segheader().tail.load(Ordering::Relaxed)
+  }
+}
+
+/// Metadata fields for the segment.
+///
+/// Values in here should only be written to by the writer thread but may be
+/// read by any thread.
+struct SegmentHeader {
+  /// Offset at which the next entry will be inserted.
+  ///
+  /// Always read this field using acquire loads to ensure that the inserted
+  /// data is visible.
+  tail: AtomicUsize,
+
+  /// Time at which this segment expires.
+  expiry: AtomicU64,
+
+  /// Index of the next segment in the list.
+  next: AtomicUsize,
+}
+
+impl SegmentHeader {
+  fn reset(&self) {
+    self
+      .tail
+      .store(std::mem::size_of::<Self>(), Ordering::SeqCst);
+    self.expiry.store(0, Ordering::SeqCst);
+    self.next.store(usize::MAX, Ordering::SeqCst);
+  }
+}
+
+impl Default for SegmentHeader {
+  fn default() -> Self {
+    let me: Self = unsafe { std::mem::zeroed() };
+    me.reset();
+    me
   }
 }
 
@@ -52,6 +113,21 @@ pub(crate) struct SegmentData<'seg> {
 }
 
 impl<'seg> SegmentData<'seg> {
+  pub(crate) fn new(data: &'seg mut [u8]) -> Self {
+    assert!(
+      data
+        .as_ptr()
+        .align_offset(std::mem::align_of::<SegmentHeader>())
+        == 0
+    );
+
+    Self {
+      ptr: unsafe { NonNull::new_unchecked(data.as_mut_ptr()) },
+      len: data.len(),
+      _phantom: PhantomData,
+    }
+  }
+
   pub(crate) fn as_ptr(&self) -> *const u8 {
     self.ptr.as_ptr() as *const u8
   }
@@ -65,6 +141,7 @@ impl<'seg> SegmentData<'seg> {
   }
 }
 
+#[derive(Copy, Clone, Debug)]
 pub(crate) struct EntryHeader {
   klen: usize,
   vlen: usize,
@@ -151,20 +228,17 @@ impl<'seg> DataRef<'seg> {
 
 pub(crate) struct SegmentIter<'a, 'seg> {
   ptr: *const u8,
-  end: *const u8,
-
-  _phantom: PhantomData<&'a Segment<'seg>>,
+  seg: &'a Segment<'seg>,
 }
 
 impl<'a, 'seg> SegmentIter<'a, 'seg> {
-  fn new(segment: &'a Segment<'seg>) -> Self {
-    let ptr = segment.data.as_ptr();
+  fn new(seg: &'a Segment<'seg>) -> Self {
+    let ptr = seg
+      .data
+      .as_ptr()
+      .wrapping_add(std::mem::size_of::<SegmentHeader>());
 
-    Self {
-      ptr,
-      end: ptr.wrapping_add(segment.tail),
-      _phantom: PhantomData,
-    }
+    Self { ptr, seg }
   }
 }
 
@@ -172,7 +246,9 @@ impl<'a, 'seg> Iterator for SegmentIter<'a, 'seg> {
   type Item = DataRef<'seg>;
 
   fn next(&mut self) -> Option<Self::Item> {
-    if self.ptr >= self.end {
+    let tail = self.seg.segheader().tail.load(Ordering::Acquire);
+    let end = self.seg.data.as_ptr().wrapping_add(tail);
+    if self.ptr >= end {
       return None;
     }
 

@@ -5,7 +5,7 @@ pub mod hashtable;
 pub mod segment;
 mod util;
 
-use crate::segment::{DataRef, EntryHeader, Segment};
+use crate::segment::{DataRef, Segment};
 
 struct CacheData<'seg> {
   data: *mut u8,
