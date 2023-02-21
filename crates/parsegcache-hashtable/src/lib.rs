@@ -104,46 +104,32 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use sharded_slab::pool::Ref;
 use sharded_slab::{Clear, Pool};
 use thiserror::Error;
 
+use crate::atomics::*;
+
+mod entry;
+
+pub use crate::entry::{Entry, RawEntry};
+
+#[cfg(feature = "loom")]
+mod atomics {
+  pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+  pub(crate) use loom::sync::Arc;
+}
+
+#[cfg(not(feature = "loom"))]
+mod atomics {
+  pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+  pub(crate) use std::sync::Arc;
+}
+
 const BUCKET_ELEMS: usize = (64 - std::mem::size_of::<usize>()) / std::mem::size_of::<u32>();
 const INVALID_BUCKET_IDX: usize = usize::MAX;
 const EMPTY_TAG: u32 = 0;
-
-pub trait Entry {
-  type Key: Hash + PartialEq;
-
-  fn key(&self) -> &Self::Key;
-}
-
-pub trait RawEntry: Entry + Copy + Sized {
-  type Target;
-
-  /// Convert this entry to a raw pointer.
-  ///
-  /// Note that the returned pointer should not be null.
-  fn as_ptr(&self) -> *const Self::Target;
-
-  /// Convert a pointer back into an entry, returning `None` if the pointer is
-  /// null.
-  ///
-  /// # Safety
-  /// `ptr` must either be null or correspond to an instance returned by
-  /// `as_ptr`.
-  unsafe fn from_ptr(ptr: *const Self::Target) -> Option<Self> {
-    match ptr {
-      p if p.is_null() => None,
-      p => Some(Self::from_ptr_unchecked(p)),
-    }
-  }
-
-  unsafe fn from_ptr_unchecked(ptr: *const Self::Target) -> Self;
-}
 
 #[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -318,7 +304,7 @@ where
 {
   pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
     let mut buckets = Vec::with_capacity(capacity.next_power_of_two());
-    buckets.resize_with(capacity, || AtomicUsize::new(0));
+    buckets.resize_with(capacity, || AtomicUsize::new(INVALID_BUCKET_IDX));
 
     Self {
       buckets,
@@ -528,14 +514,11 @@ where
 }
 
 impl<T> Bucket<T> {
-  const KEY_INIT: AtomicU32 = AtomicU32::new(EMPTY_TAG);
-  const VAL_INIT: AtomicPtr<T> = AtomicPtr::new(std::ptr::null_mut());
-
-  pub const fn new() -> Self {
+  pub fn new() -> Self {
     Self {
-      keys: [Self::KEY_INIT; BUCKET_ELEMS],
+      keys: std::array::from_fn(|_| AtomicU32::new(EMPTY_TAG)),
       next: AtomicUsize::new(usize::MAX),
-      values: [Self::VAL_INIT; BUCKET_ELEMS],
+      values: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
     }
   }
 }
