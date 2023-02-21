@@ -135,24 +135,8 @@ const INVALID_BUCKET_IDX: usize = usize::MAX;
 const EMPTY_TAG: u32 = 0;
 
 #[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CommandError {
-  #[error("no backing memory capacity available to insert into hashtable")]
-  NoCapacity,
-
-  #[error("the cache writer thread has shut down")]
-  NoWriter,
-}
-
-#[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
 #[error("no backing memory capacity available to insert into the hashtable")]
 pub struct CapacityError;
-
-impl From<CapacityError> for CommandError {
-  fn from(_: CapacityError) -> Self {
-    Self::NoCapacity
-  }
-}
 
 pub struct Writer<T, S = RandomState>
 where
