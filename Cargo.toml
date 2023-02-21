@@ -14,8 +14,10 @@ sharded-slab = "0.1.4"
 stable-vec = "0.4.0"
 thiserror = "1.0.37"
 
+parsegcache-hashtable = { path = "crates/hashtable" }
+
 [workspace]
 members = [
   ".",
-  "crates/parsegcache-hashtable",
+  "crates/hashtable",
 ]
