@@ -29,5 +29,3 @@ fn concurrent_read_insert() {
     }
   })
 }
-
-

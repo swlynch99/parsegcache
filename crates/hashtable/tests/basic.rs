@@ -40,7 +40,7 @@ fn erase_present() {
   let mut writer = Writer::with_capacity_and_hasher(1024, RandomState::new());
 
   writer.insert(&A).unwrap();
-  
+
   assert_matches!(writer.erase(&"test"), Some(&v) if v == A);
 }
 // #[test]
