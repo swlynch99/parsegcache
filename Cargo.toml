@@ -3,6 +3,9 @@ name = "parsegcache"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+loom = [ "dep:loom", "parsegcache-hashtable/loom" ]
+
 [dependencies]
 parsegcache-hashtable = { path = "crates/hashtable" }
 parsegcache-wheel = { path = "crates/wheel" }
@@ -10,12 +13,11 @@ parsegcache-wheel = { path = "crates/wheel" }
 crossbeam = "0.8.2"
 memmap2 = "0.5.8"
 memoffset = "0.8.0"
-oneshot = { version = "0.1.5", features = ["async"] }
-sharded-slab = "0.1.4"
 stable-vec = "0.4.0"
 thiserror = "1.0.37"
-arrayvec = "0.7.2"
 ouroboros = "0.15.5"
+
+loom = { version = "0.5.6", optional = true }
 
 [workspace]
 members = [
