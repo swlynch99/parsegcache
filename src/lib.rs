@@ -3,9 +3,14 @@
 pub mod epoch;
 pub mod hashtable;
 pub mod segment;
+pub mod wheel;
 mod util;
 
 use crate::segment::{DataRef, Segment};
+
+pub struct CacheConfig {
+  pub segment_len: usize,
+}
 
 struct CacheData<'seg> {
   data: *mut u8,
