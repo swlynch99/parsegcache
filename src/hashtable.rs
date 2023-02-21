@@ -95,6 +95,12 @@
 //! thread. If there were multiple then it would be possible for other writers
 //! to mess things up between the writes to the tag and value which would result
 //! in an inconsistent table state.
+//!
+//! # Future Work
+//! - It should be possible to remove values from the hash table as long as
+//!   entries are only moved to a later slot in the chain. When doing an erase
+//!   we should move the earliest entry down into the newly filled slot and free
+//!   the first bucket in the chain if empty.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
