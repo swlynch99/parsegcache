@@ -191,13 +191,13 @@ impl<'h> Drop for EpochGuard<'h> {
 }
 
 pub struct EpochRef<'h, T> {
-  guard: EpochGuard<'h>,
+  _guard: EpochGuard<'h>,
   value: T,
 }
 
 impl<'h, T> EpochRef<'h, T> {
   pub(crate) fn new(guard: EpochGuard<'h>, value: T) -> Self {
-    Self { guard, value }
+    Self { _guard: guard, value }
   }
 }
 

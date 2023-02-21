@@ -66,6 +66,7 @@ impl<'seg> Segment<'seg> {
   ///
   /// The [`DataRef`] instance must also not be accessed after calling this
   /// method.
+  #[allow(dead_code)]
   pub(crate) unsafe fn uninsert(&mut self, data: DataRef<'seg>) {
     let seghdr = self.header();
     let step_len = data.step_len();
@@ -84,20 +85,8 @@ impl<'seg> Segment<'seg> {
     EntryIter::new(self)
   }
 
-  pub(crate) fn next_segment_mut(&mut self) -> Option<&mut Segment<'seg>> {
-    unsafe { (*self.header().next.get()).as_mut() }
-  }
-
-  pub(crate) unsafe fn next_segment(&self) -> Option<&Segment<'seg>> {
-    (*self.header().next.get()).as_ref()
-  }
-
   pub(crate) fn take_next(&mut self) -> Option<Segment<'seg>> {
     unsafe { &mut *self.header().next.get() }.take()
-  }
-
-  pub(crate) fn is_tail(&self) -> bool {
-    unsafe { self.next_segment().is_none() }
   }
 
   /// Extend this segment with another one.
@@ -257,14 +246,6 @@ pub struct DataRef<'seg> {
 }
 
 impl<'seg> DataRef<'seg> {
-  pub(crate) unsafe fn new(ptr: *const u8) -> Option<Self> {
-    if ptr.is_null() {
-      None
-    } else {
-      Some(Self::from_ptr(ptr))
-    }
-  }
-
   /// Create a DataRef from an existing pointer.
   ///
   /// # Safety

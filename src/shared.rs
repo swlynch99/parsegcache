@@ -1,14 +1,12 @@
 use std::time::SystemTime;
 
-use memmap2::MmapRaw;
-
-use crate::CacheConfig;
 use crate::segment::{DataRef, SegmentHeader};
+use crate::{CacheConfig, Mmap};
 
 #[derive(Clone)]
 pub(crate) struct Shared<'seg> {
   pub config: CacheConfig,
-  pub data: &'seg MmapRaw
+  pub data: &'seg Mmap,
 }
 
 impl<'seg> Shared<'seg> {
@@ -25,7 +23,7 @@ impl<'seg> Shared<'seg> {
 
     unsafe { &*(segment as *const SegmentHeader) }
   }
-  
+
   pub fn expiry_for(&self, data: DataRef<'seg>) -> SystemTime {
     self.data_segment(data).expiry()
   }

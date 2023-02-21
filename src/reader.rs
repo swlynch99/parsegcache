@@ -1,12 +1,11 @@
 use std::time::SystemTime;
 
-use memmap2::MmapRaw;
 use parsegcache_hashtable::Reader;
 
 use crate::epoch::{EpochRef, Handle};
 use crate::segment::DataRef;
 use crate::shared::Shared;
-use crate::{CacheConfig, Entry};
+use crate::{CacheConfig, Entry, Mmap};
 
 #[derive(Clone)]
 pub(crate) struct CacheReader<'seg> {
@@ -50,10 +49,10 @@ impl<'seg> CacheReader<'seg> {
   /// # Panics
   /// Panics if data is not a reference to the same `MmapRaw` that was used to
   /// construct this `Reader`.
-  pub(crate) fn transmute_lifetime<'a>(self, data: &'a MmapRaw) -> CacheReader<'a> {
+  pub(crate) fn transmute_lifetime<'a>(self, data: &'a Mmap) -> CacheReader<'a> {
     // This is only valid if we're referring to the same instance of data with
     // different lifetimes.
-    assert_eq!(self.shared.data as *const MmapRaw, data as *const MmapRaw);
+    assert_eq!(self.shared.data as *const Mmap, data as *const Mmap);
 
     // SAFETY: data is a reference to the same MmapRaw instance as self.shared.data.
     //        'seg is only for data borrowed from self.shared.data so it is safe to

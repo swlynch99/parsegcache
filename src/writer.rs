@@ -66,7 +66,9 @@ impl<'seg> CacheWriter<'seg> {
     key: &[u8],
     value: &[u8],
     expiry: SystemTime,
-  ) -> Result<Option<Entry<'seg>>, CapacityError> {
+  ) -> Result<Option<Entry>, CapacityError> {
+    unsafe { self.tick() };
+
     let entry = match self.write(key, value, expiry) {
       Ok(entry) => entry,
       Err(WriteError::ExpiryInPast) => {
@@ -95,7 +97,9 @@ impl<'seg> CacheWriter<'seg> {
     }
   }
 
-  pub fn delete(&mut self, key: &[u8]) -> Option<Entry<'seg>> {
+  pub fn delete(&mut self, key: &[u8]) -> Option<Entry> {
+    unsafe { self.tick() };
+
     let data = self.hashtable.erase(key)?;
     let expiry = self.shared.expiry_for(data);
     self.on_erase(data);
@@ -108,6 +112,8 @@ impl<'seg> CacheWriter<'seg> {
   }
 
   pub fn expire(&mut self) {
+    unsafe { self.tick() };
+    
     if let Some(bucket) = self.wheel.reclaim() {
       if let Some(segment) = bucket.segment {
         self.collectq.push_back(segment);
@@ -131,7 +137,7 @@ impl<'seg> CacheWriter<'seg> {
     }
   }
 
-  pub fn get(&self, key: &[u8]) -> Option<Entry<'seg>> {
+  pub fn get(&self, key: &[u8]) -> Option<Entry> {
     let data = self.hashtable.get(key)?;
     let expiry = self.shared.expiry_for(data);
 
@@ -189,6 +195,15 @@ impl<'seg> CacheWriter<'seg> {
     }
   }
 
+  /// Advance the current epoch.
+  /// 
+  /// # Safety
+  /// There should be no outstanding borrows not protected by an `EpochGuard`
+  /// when this is called.
+  unsafe fn tick(&mut self) {
+    self.freelist.collector.advance();
+  }
+
   fn data_segment(&self, data: DataRef<'seg>) -> &SegmentHeader {
     self.shared.data_segment(data)
   }
@@ -222,14 +237,6 @@ impl<'seg> CacheFreelist<'seg> {
     }
 
     Some(segment)
-  }
-
-  pub fn collect(&mut self) -> bool {
-    self
-      .collector
-      .recycle()
-      .map(|segment| self.freelist.push(segment))
-      .is_some()
   }
 }
 

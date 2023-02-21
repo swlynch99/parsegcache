@@ -33,6 +33,7 @@ impl<T> IntCell<T> {
     Self(Cell::new(value))
   }
 
+  #[allow(dead_code)]
   pub fn get_mut(&mut self) -> &mut T {
     self.0.get_mut()
   }
@@ -50,6 +51,7 @@ impl<T: Copy> IntCell<T> {
 
 macro_rules! decl_fetch_op {
   ($trait:ident, $tmethod:ident, $method:ident) => {
+    #[allow(dead_code)]
     impl<T: Copy + $trait<Output = T>> IntCell<T> {
       pub fn $method(&self, value: T) -> T {
         self.replace($trait::$tmethod(self.get(), value))

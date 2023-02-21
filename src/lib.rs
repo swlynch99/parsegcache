@@ -1,27 +1,34 @@
-
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use memmap2::MmapRaw;
 use ouroboros::self_referencing;
 use parsegcache_hashtable::CapacityError;
 
 use crate::epoch::EpochRef;
 use crate::reader::CacheReader;
 use crate::segment::DataRef;
+use crate::shared::Shared;
 use crate::writer::CacheWriter;
 
 pub mod epoch;
-pub mod segment;
 mod reader;
+mod segment;
 mod shared;
 mod util;
 mod writer;
 
+type Mmap = memmap2::MmapRaw;
+
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct CacheConfig {
   pub hashtable_capacity: usize,
+
+  /// The length of each segment in the cache backend.
   pub segment_len: usize,
+
+  /// The number of segments available to the cache backend.
+  pub segment_count: usize,
 
   pub timer_span: Duration,
   pub timer_bucket: Duration,
@@ -63,9 +70,20 @@ impl<'seg> Entry<'seg> {
   }
 }
 
+#[non_exhaustive]
+pub struct CacheBuilder {
+  pub config: CacheConfig,
+}
+
+impl CacheBuilder {
+  pub fn build(self) -> std::io::Result<Writer> {
+    Writer::new(self.config)
+  }
+}
+
 #[self_referencing]
 struct WriterDetail {
-  data: Arc<MmapRaw>,
+  data: Arc<Mmap>,
 
   #[borrows(data)]
   #[not_covariant]
@@ -75,13 +93,39 @@ struct WriterDetail {
 pub struct Writer(WriterDetail);
 
 impl Writer {
+  pub(crate) fn new(config: CacheConfig) -> std::io::Result<Self> {
+    use std::io;
+
+    use memmap2::MmapMut;
+
+    let data = MmapMut::map_anon(
+      config
+        .segment_count
+        .checked_mul(config.segment_len)
+        .ok_or_else(|| {
+          io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "total size of segment array exceeded usize::MAX",
+          )
+        })?,
+    )?;
+
+    let data = Arc::new(data.into());
+    Ok(Self(WriterDetail::new(data, move |data| {
+      CacheWriter::new(Shared {
+        config,
+        data: &data,
+      })
+    })))
+  }
+
   /// Fetch an entry from the cache, if present.
   pub fn get(&self, key: &[u8]) -> Option<Entry> {
     self.0.with_cache(|cache| cache.get(key))
   }
 
   /// Set an entry within the cache.
-  /// 
+  ///
   /// Returns the previous entry within the cache, or an error if there was no
   /// capacity to insert the new entry into the cache.
   pub fn set(
@@ -94,20 +138,20 @@ impl Writer {
   }
 
   /// Delete an entry from the cache.
-  /// 
+  ///
   /// Returns the deleted entry, if one was present within the cache.
   pub fn delete(&mut self, key: &[u8]) -> Option<Entry> {
     self.0.with_cache_mut(|cache| cache.delete(key))
   }
 
   /// Perform background cleanup tasks on the cache.
-  /// 
+  ///
   /// This includes
   /// - removing entries that have expired,
   /// - (in the future) evicting cache entries when free space is low, and,
   /// - garbage collecting expired segments that are no longer referenced by a
   ///   reader thread.
-  /// 
+  ///
   /// It is recommended to call expire frequently. Ideally it would be called
   /// after every command and periodically if no commands are being issued to
   /// the `Writer`. Under the default config, `expire` is a lightweight and
@@ -133,7 +177,7 @@ impl Writer {
 
 #[self_referencing]
 pub struct ReaderDetail {
-  data: Arc<MmapRaw>,
+  data: Arc<Mmap>,
 
   #[borrows(data)]
   #[not_covariant]
@@ -148,7 +192,7 @@ impl Reader {
   /// # Panics
   /// Panics if `data` does not point to the same [`MmapRaw`] instance that the
   /// [`CacheReader`] was constructed with.
-  pub(crate) fn new(data: Arc<MmapRaw>, cache: CacheReader<'_>) -> Self {
+  pub(crate) fn new(data: Arc<Mmap>, cache: CacheReader<'_>) -> Self {
     Self(ReaderDetail::new(data, move |data| {
       cache.transmute_lifetime(&data)
     }))
@@ -173,7 +217,6 @@ impl Clone for Reader {
     }))
   }
 }
-
 
 #[test]
 fn assert_send_sync() {
