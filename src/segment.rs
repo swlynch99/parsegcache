@@ -4,6 +4,8 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
+use parsegcache_hashtable::{Entry, RawEntry};
+
 use crate::util::ByteWriter;
 
 pub(crate) struct Segment<'seg> {
@@ -125,6 +127,9 @@ impl<'seg> Segment<'seg> {
     self.data.len() - self.header().tail.load(Ordering::Relaxed)
   }
 }
+
+unsafe impl Send for Segment<'_> {}
+unsafe impl Sync for Segment<'_> {}
 
 /// Metadata fields for the segment.
 ///
@@ -302,6 +307,29 @@ impl<'seg> DataRef<'seg> {
     self.header().step_len()
   }
 }
+
+impl<'seg> Entry for DataRef<'seg> {
+  type Key = [u8];
+
+  fn key(&self) -> &Self::Key {
+    self.key()
+  }
+}
+
+impl<'seg> RawEntry for DataRef<'seg> {
+  type Target = u8;
+
+  fn as_ptr(&self) -> *const Self::Target {
+    self.as_ptr()
+  }
+
+  unsafe fn from_ptr_unchecked(ptr: *const Self::Target) -> Self {
+    Self::from_ptr(ptr)
+  }
+}
+
+unsafe impl Send for DataRef<'_> {}
+unsafe impl Sync for DataRef<'_> {}
 
 pub(crate) struct EntryIter<'a, 'seg> {
   ptr: *const u8,

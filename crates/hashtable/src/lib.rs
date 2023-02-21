@@ -277,6 +277,18 @@ where
   _phantom: PhantomData<T>,
 }
 
+unsafe impl<T, S> Send for HashTable<T, S>
+where
+  T: RawEntry + Send,
+  S: Send
+{}
+
+unsafe impl<T, S> Sync for HashTable<T, S>
+where
+  T: RawEntry + Sync,
+  S: Sync
+{}
+
 #[repr(C, align(64))]
 struct Bucket<T> {
   keys: [AtomicU32; BUCKET_ELEMS],
@@ -671,7 +683,7 @@ where
   }
 }
 
-// #[test]
-// fn test_bucket_field_offsets() {
-//   assert_eq!(memoffset::offset_of!(Bucket, values), 64);
-// }
+#[test]
+fn test_bucket_field_offsets() {
+  assert_eq!(memoffset::offset_of!(Bucket<*const ()>, values), 64);
+}

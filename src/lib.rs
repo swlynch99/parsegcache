@@ -1,25 +1,25 @@
 #![allow(dead_code)]
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
-use crossbeam::channel::Sender;
-use hashtable::CommandError;
+use memmap2::MmapRaw;
+use ouroboros::self_referencing;
+use parsegcache_hashtable::CapacityError;
 
 use crate::epoch::EpochRef;
+use crate::reader::CacheReader;
 use crate::segment::DataRef;
+use crate::writer::CacheWriter;
 
-pub mod cache;
 pub mod epoch;
-pub mod hashtable;
 pub mod segment;
-// pub mod threads;
+mod reader;
+mod shared;
 mod util;
-pub mod wheel;
+mod writer;
 
+#[derive(Clone, Debug)]
 pub struct CacheConfig {
   pub hashtable_capacity: usize,
   pub segment_len: usize,
@@ -41,118 +41,126 @@ pub struct CacheConfig {
   pub expire_per_iter: usize,
 }
 
-#[derive(Clone)]
-pub struct CacheHandle {
-  shared: Arc<cache::Shared>,
-  channel: Sender<CacheCommand>,
-  handle: epoch::Handle,
+pub struct Entry<'seg> {
+  data: DataRef<'seg>,
+  expiry: SystemTime,
 }
 
-impl CacheHandle {
-  /// Read a value from the cache
-  pub fn get(&self, key: &[u8]) -> Option<EpochRef<DataRef>> {
-    let guard = self.handle.pin();
-    let data = self.shared.hashtable().get(key)?;
-
-    // TODO: Check expiry time?
-
-    Some(EpochRef::new(guard, data))
+impl<'seg> Entry<'seg> {
+  pub(crate) fn new(data: DataRef<'seg>, expiry: SystemTime) -> Self {
+    Self { data, expiry }
   }
 
-  pub fn set(&self, key: &[u8], value: &[u8], expiry: SystemTime) -> UpdateFuture {
-    let (tx, rx) = oneshot::channel();
-    if let Err(e) = self.channel.send(CacheCommand::Set {
-      key: key.to_vec(),
-      value: value.to_vec(),
-      expiry,
-      chan: tx,
-    }) {
-      match e.into_inner() {
-        CacheCommand::Set {
-          key, value, chan, ..
-        } => chan
-          .send(UpdateResponse {
-            key,
-            val: Some(value),
-            err: Some(CommandError::NoWriter),
-          })
-          .unwrap(),
-        _ => unreachable!(),
-      }
-    }
-
-    UpdateFuture { recv: rx }
+  pub fn key(&self) -> &[u8] {
+    self.data.key()
   }
 
-  pub fn delete(&self, key: &[u8]) -> UpdateFuture {
-    let (tx, rx) = oneshot::channel();
+  pub fn value(&self) -> &[u8] {
+    self.data.value()
+  }
 
-    let cmd = CacheCommand::Delete {
-      key: key.to_vec(),
-      chan: tx,
-    };
-    if let Err(e) = self.channel.send(cmd) {
-      match e.into_inner() {
-        CacheCommand::Delete { key, chan } => chan
-          .send(UpdateResponse {
-            key,
-            val: None,
-            err: Some(CommandError::NoWriter),
-          })
-          .unwrap(),
-        _ => unreachable!(),
-      }
-    }
-
-    UpdateFuture { recv: rx }
+  pub fn expiry(&self) -> SystemTime {
+    self.expiry
   }
 }
 
-#[must_use]
-pub struct UpdateFuture {
-  recv: oneshot::Receiver<UpdateResponse>,
+#[self_referencing]
+struct WriterDetail {
+  data: Arc<MmapRaw>,
+
+  #[borrows(data)]
+  #[not_covariant]
+  cache: CacheWriter<'this>,
 }
 
-impl UpdateFuture {
-  pub fn get(self) -> Result<(), CommandError> {
-    match self.recv.recv() {
-      Ok(UpdateResponse { err: Some(e), .. }) => Err(e),
-      Ok(UpdateResponse { .. }) => Ok(()),
-      Err(_) => Err(CommandError::NoWriter),
-    }
+pub struct Writer(WriterDetail);
+
+impl Writer {
+  pub fn get(&self, key: &[u8]) -> Option<Entry> {
+    self.0.with_cache(|cache| cache.get(key))
   }
-}
 
-impl Future for UpdateFuture {
-  type Output = Result<(), CommandError>;
-
-  fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-    Poll::Ready(match Pin::new(&mut self.recv).poll(cx) {
-      Poll::Pending => return Poll::Pending,
-      Poll::Ready(Ok(resp)) => match resp.err {
-        Some(err) => Err(err),
-        None => Ok(()),
-      },
-      Poll::Ready(Err(_)) => Err(CommandError::NoWriter),
-    })
-  }
-}
-
-struct UpdateResponse {
-  key: Vec<u8>,
-  val: Option<Vec<u8>>,
-  err: Option<CommandError>,
-}
-
-enum CacheCommand {
-  Set {
-    key: Vec<u8>,
-    value: Vec<u8>,
+  pub fn set(
+    &mut self,
+    key: &[u8],
+    value: &[u8],
     expiry: SystemTime,
-    chan: oneshot::Sender<UpdateResponse>,
-  },
-  Delete {
-    key: Vec<u8>,
-    chan: oneshot::Sender<UpdateResponse>,
-  },
+  ) -> Result<DataRef, CapacityError> {
+    self.0.with_cache_mut(|cache| cache.set(key, value, expiry))
+  }
+
+  pub fn delete(&mut self, key: &[u8]) -> Option<DataRef> {
+    self.0.with_cache_mut(|cache| cache.delete(key))
+  }
+
+  pub fn expire(&mut self) {
+    self.0.with_cache_mut(|cache| cache.expire())
+  }
+
+  pub fn reader(&mut self) -> Reader {
+    let data = self.0.borrow_data().clone();
+
+    self
+      .0
+      .with_cache_mut(move |cache| Reader::new(data, cache.reader()))
+  }
+
+  pub fn config(&self) -> &CacheConfig {
+    self.0.with_cache(|cache| cache.config())
+  }
+}
+
+#[self_referencing]
+pub struct ReaderDetail {
+  data: Arc<MmapRaw>,
+
+  #[borrows(data)]
+  #[not_covariant]
+  cache: CacheReader<'this>,
+}
+
+pub struct Reader(ReaderDetail);
+
+impl Reader {
+  /// Construct a new `Reader` from its component parts.
+  ///
+  /// # Panics
+  /// Panics if `data` does not point to the same [`MmapRaw`] instance that the
+  /// [`CacheReader`] was constructed with.
+  pub(crate) fn new(data: Arc<MmapRaw>, cache: CacheReader<'_>) -> Self {
+    Self(ReaderDetail::new(data, move |data| {
+      cache.transmute_lifetime(&data)
+    }))
+  }
+
+  pub fn get(&self, key: &[u8]) -> Option<EpochRef<Entry>> {
+    self.0.with_cache(|cache| cache.get(key))
+  }
+
+  pub fn config(&self) -> &CacheConfig {
+    self.0.with_cache(|cache| cache.config())
+  }
+}
+
+impl Clone for Reader {
+  fn clone(&self) -> Self {
+    let data = self.0.borrow_data().clone();
+    Self(ReaderDetail::new(data, |data| {
+      self
+        .0
+        .with_cache(|cache| cache.clone().transmute_lifetime(&data))
+    }))
+  }
+}
+
+
+#[test]
+fn assert_send_sync() {
+  fn assert_send<T: Send>() {}
+  fn assert_sync<T: Sync>() {}
+
+  assert_send::<Writer>();
+  assert_sync::<Writer>();
+
+  assert_send::<Reader>();
 }
