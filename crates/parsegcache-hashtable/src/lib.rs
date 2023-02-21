@@ -165,7 +165,7 @@ impl From<CapacityError> for CommandError {
   }
 }
 
-pub struct Writer<T, S>
+pub struct Writer<T, S = RandomState>
 where
   T: RawEntry,
 {
@@ -175,8 +175,30 @@ where
 impl<T, S> Writer<T, S>
 where
   T: RawEntry,
+  S: BuildHasher + Default,
+{
+  pub fn with_capacity(capacity: usize) -> Self {
+    Self::new(HashTable::with_capacity(capacity))
+  }
+}
+
+impl<T, S> Writer<T, S>
+where
+  T: RawEntry,
   S: BuildHasher,
 {
+  fn new(table: HashTable<T, S>) -> Self {
+    Self {
+      reader: Reader {
+        table: Arc::new(table),
+      },
+    }
+  }
+
+  pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
+    Self::new(HashTable::with_capacity_and_hasher(capacity, hasher))
+  }
+
   /// Insert a value into the hashtable.
   ///
   /// If there is a value with the same key in the hashtable then it will be
@@ -202,6 +224,10 @@ where
   pub fn erase_by_entry(&mut self, entry: T) -> bool {
     unsafe { self.reader.table.erase_by_entry(entry) }
   }
+
+  pub fn reader(&self) -> &Reader<T, S> {
+    &self.reader
+  }
 }
 
 impl<T, S> Deref for Writer<T, S>
@@ -215,7 +241,7 @@ where
   }
 }
 
-pub struct Reader<T, S>
+pub struct Reader<T, S = RandomState>
 where
   T: RawEntry,
 {
@@ -252,7 +278,7 @@ where
   }
 }
 
-pub struct HashTable<T, S = RandomState>
+struct HashTable<T, S = RandomState>
 where
   T: RawEntry,
 {
