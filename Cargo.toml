@@ -3,9 +3,10 @@ name = "parsegcache"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
+parsegcache-hashtable = { path = "crates/hashtable" }
+parsegcache-wheel = { path = "crates/wheel" }
+
 crossbeam = "0.8.2"
 memmap2 = "0.5.8"
 memoffset = "0.8.0"
@@ -13,11 +14,12 @@ oneshot = { version = "0.1.5", features = ["async"] }
 sharded-slab = "0.1.4"
 stable-vec = "0.4.0"
 thiserror = "1.0.37"
-
-parsegcache-hashtable = { path = "crates/hashtable" }
+arrayvec = "0.7.2"
+ouroboros = "0.15.5"
 
 [workspace]
 members = [
   ".",
   "crates/hashtable",
+  "crates/wheel",
 ]

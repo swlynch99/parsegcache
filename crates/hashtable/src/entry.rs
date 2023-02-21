@@ -1,7 +1,7 @@
 use std::hash::Hash;
 
 pub trait Entry {
-  type Key: Hash + PartialEq;
+  type Key: ?Sized + Hash + PartialEq;
 
   fn key(&self) -> &Self::Key;
 }
